@@ -1,5 +1,5 @@
 import { PassThrough } from "node:stream";
-import type { DiscordAccountConfig, OpenClawConfig } from "openclaw/plugin-sdk/config-types";
+import type { DiscordAccountConfig, OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
   buildRealtimeVoiceAgentConsultChatMessage,
   buildRealtimeVoiceAgentConsultPolicyInstructions,
@@ -45,7 +45,37 @@ const DISCORD_REALTIME_RECENT_AGENT_PROXY_CONSULT_TTL_MS = 15_000;
 const DISCORD_REALTIME_LOG_PREVIEW_CHARS = 500;
 const DISCORD_REALTIME_DEFAULT_MIN_BARGE_IN_AUDIO_END_MS = 250;
 const DISCORD_REALTIME_FORCED_CONSULT_FALLBACK_DELAY_MS = 200;
+const DISCORD_REALTIME_DUPLICATE_ERROR_SUPPRESS_MS = 60_000;
 const REALTIME_PCM16_BYTES_PER_SAMPLE = 2;
+const DISCORD_REALTIME_FORCED_CONSULT_TRAILING_FRAGMENT_WORDS = new Set([
+  "a",
+  "about",
+  "an",
+  "and",
+  "as",
+  "at",
+  "because",
+  "but",
+  "by",
+  "for",
+  "from",
+  "in",
+  "of",
+  "on",
+  "or",
+  "so",
+  "that",
+  "the",
+  "then",
+  "to",
+  "with",
+]);
+const DISCORD_REALTIME_VERBOSE_OMITTED_EVENTS = new Set([
+  "conversation.output_audio.delta",
+  "input_audio_buffer.append",
+  "response.audio.delta",
+  "response.output_audio.delta",
+]);
 
 export type DiscordVoiceMode = "stt-tts" | "agent-proxy" | "bidi";
 
@@ -119,6 +149,32 @@ function formatRealtimeInterruptionLog(event: RealtimeVoiceBridgeEvent): string 
     ) {
       return `discord voice: realtime model interrupt raced ${event.direction}:${event.type}${detail}`;
     }
+  }
+  return undefined;
+}
+
+function shouldLogRealtimeVerboseEvent(event: RealtimeVoiceBridgeEvent): boolean {
+  return !DISCORD_REALTIME_VERBOSE_OMITTED_EVENTS.has(event.type);
+}
+
+function classifySkippableForcedAgentProxyTranscript(text: string): string | undefined {
+  const normalized = text.replace(/\s+/g, " ").trim().toLowerCase();
+  if (!normalized) {
+    return "empty";
+  }
+  if (/(\.\.\.|…)\s*$/.test(normalized)) {
+    return "incomplete-transcript";
+  }
+  const lastWord = normalized.match(/[a-z']+$/)?.[0]?.replace(/^'+|'+$/g, "");
+  if (lastWord && DISCORD_REALTIME_FORCED_CONSULT_TRAILING_FRAGMENT_WORDS.has(lastWord)) {
+    return "trailing-fragment";
+  }
+  if (
+    !normalized.includes("?") &&
+    (/^(i'?ll|i will) be (right )?back\b/.test(normalized) ||
+      /\b(see you|bye(?:-bye)?|goodbye)\b/.test(normalized))
+  ) {
+    return "non-actionable-closing";
   }
   return undefined;
 }
@@ -277,6 +333,9 @@ export class DiscordRealtimeVoiceSession implements VoiceRealtimeSession {
   private queuedExactSpeechMessages: string[] = [];
   private exactSpeechResponseActive = false;
   private exactSpeechAudioStarted = false;
+  private lastRealtimeError:
+    | { message: string; suppressed: number; lastLoggedAt: number }
+    | undefined;
   private readonly playerIdleHandler = () => {
     this.resetOutputStream("player-idle");
     this.completeExactSpeechResponse("player-idle");
@@ -381,7 +440,9 @@ export class DiscordRealtimeVoiceSession implements VoiceRealtimeSession {
       onToolCall: (event, session) => this.handleToolCall(event, session),
       onEvent: (event) => {
         const detail = event.detail ? ` ${event.detail}` : "";
-        logVoiceVerbose(`realtime ${event.direction}:${event.type}${detail}`);
+        if (shouldLogRealtimeVerboseEvent(event)) {
+          logVoiceVerbose(`realtime ${event.direction}:${event.type}${detail}`);
+        }
         const responseEnded =
           event.direction === "server" &&
           (event.type === "response.done" || event.type === "response.cancelled");
@@ -396,9 +457,11 @@ export class DiscordRealtimeVoiceSession implements VoiceRealtimeSession {
           logger.info(interruptionLog);
         }
       },
-      onError: (error) =>
-        logger.warn(`discord voice: realtime error: ${formatErrorMessage(error)}`),
-      onClose: (reason) => logVoiceVerbose(`realtime closed: ${reason}`),
+      onError: (error) => this.logRealtimeError(formatErrorMessage(error)),
+      onClose: (reason) => {
+        this.flushSuppressedRealtimeErrors();
+        logVoiceVerbose(`realtime closed: ${reason}`);
+      },
     });
     const resolvedModel =
       readProviderConfigString(resolved.providerConfig, "model") ?? resolved.provider.defaultModel;
@@ -421,6 +484,7 @@ export class DiscordRealtimeVoiceSession implements VoiceRealtimeSession {
 
   close(): void {
     this.stopped = true;
+    this.flushSuppressedRealtimeErrors();
     this.talkback.close();
     this.clearForcedConsultTimers();
     this.pendingAgentProxyConsultContexts = [];
@@ -434,6 +498,30 @@ export class DiscordRealtimeVoiceSession implements VoiceRealtimeSession {
     this.bridge = null;
     const voiceSdk = loadDiscordVoiceSdk();
     this.params.entry.player.off(voiceSdk.AudioPlayerStatus.Idle, this.playerIdleHandler);
+  }
+
+  private logRealtimeError(message: string): void {
+    const now = Date.now();
+    if (
+      this.lastRealtimeError?.message === message &&
+      now - this.lastRealtimeError.lastLoggedAt < DISCORD_REALTIME_DUPLICATE_ERROR_SUPPRESS_MS
+    ) {
+      this.lastRealtimeError.suppressed += 1;
+      return;
+    }
+    this.flushSuppressedRealtimeErrors();
+    this.lastRealtimeError = { message, suppressed: 0, lastLoggedAt: now };
+    logger.warn(`discord voice: realtime error: ${message}`);
+  }
+
+  private flushSuppressedRealtimeErrors(): void {
+    if (!this.lastRealtimeError || this.lastRealtimeError.suppressed === 0) {
+      return;
+    }
+    logger.warn(
+      `discord voice: suppressed ${this.lastRealtimeError.suppressed} duplicate realtime errors: ${this.lastRealtimeError.message}`,
+    );
+    this.lastRealtimeError.suppressed = 0;
   }
 
   beginSpeakerTurn(context: VoiceRealtimeSpeakerContext, userId: string): VoiceRealtimeSpeakerTurn {
@@ -539,6 +627,12 @@ export class DiscordRealtimeVoiceSession implements VoiceRealtimeSession {
       return;
     }
     this.syncOutputAudioTimestamp();
+    if (this.outputStreamEnding) {
+      logVoiceVerbose(
+        `realtime output audio ignored after stream ending: guild ${this.params.entry.guildId} channel ${this.params.entry.channelId}`,
+      );
+      return;
+    }
     const stream = this.ensureOutputStream();
     if (this.exactSpeechResponseActive) {
       this.exactSpeechAudioStarted = true;
@@ -554,7 +648,7 @@ export class DiscordRealtimeVoiceSession implements VoiceRealtimeSession {
   }
 
   private ensureOutputStream(): PassThrough {
-    if (this.outputStream && !this.outputStream.destroyed) {
+    if (this.outputStream && !this.outputStream.destroyed && !this.outputStream.writableEnded) {
       return this.outputStream;
     }
     const voiceSdk = loadDiscordVoiceSdk();
@@ -566,7 +660,7 @@ export class DiscordRealtimeVoiceSession implements VoiceRealtimeSession {
         this.logOutputAudioStopped("stream-close");
         this.outputStream = null;
         this.resetOutputAudioStats();
-        this.completeExactSpeechResponse("stream-close");
+        this.completeExactSpeechResponse("stream-close", { drain: false });
       }
     });
     const resource = voiceSdk.createAudioResource(stream, {
@@ -629,12 +723,15 @@ export class DiscordRealtimeVoiceSession implements VoiceRealtimeSession {
     this.bridge?.sendUserMessage(buildDiscordSpeakExactUserMessage(text));
   }
 
-  private completeExactSpeechResponse(reason: string): void {
+  private completeExactSpeechResponse(reason: string, options?: { drain?: boolean }): void {
     if (!this.exactSpeechResponseActive && this.queuedExactSpeechMessages.length === 0) {
       return;
     }
     this.exactSpeechResponseActive = false;
     this.exactSpeechAudioStarted = false;
+    if (options?.drain === false) {
+      return;
+    }
     this.drainQueuedExactSpeechMessages(reason);
   }
 
@@ -811,6 +908,13 @@ export class DiscordRealtimeVoiceSession implements VoiceRealtimeSession {
       return;
     }
     const context = this.consumePendingSpeakerContext();
+    const skipReason = classifySkippableForcedAgentProxyTranscript(question);
+    if (skipReason) {
+      logger.info(
+        `discord voice: realtime forced agent consult skipped reason=${skipReason} chars=${question.length} speaker=${context?.speakerLabel ?? "unknown"} transcript=${formatRealtimeLogPreview(question)}`,
+      );
+      return;
+    }
     if (!context) {
       const recent = this.findRecentAgentProxyConsultContext(question);
       if (recent) {
@@ -890,10 +994,8 @@ export class DiscordRealtimeVoiceSession implements VoiceRealtimeSession {
     );
     if (this.hasInterruptibleOutputAudio()) {
       logger.info(
-        `discord voice: realtime barge-in requested reason=forced-agent-consult guild=${this.params.entry.guildId} channel=${this.params.entry.channelId} outputAudioMs=${Math.floor(this.outputAudioTimestampMs)} outputActive=${this.isOutputAudioActive()} playbackChunks=${this.outputAudioChunks} force=true`,
+        `discord voice: realtime forced agent consult preserving active playback guild=${this.params.entry.guildId} channel=${this.params.entry.channelId} outputAudioMs=${Math.floor(this.outputAudioTimestampMs)} outputActive=${this.isOutputAudioActive()} playbackChunks=${this.outputAudioChunks}`,
       );
-      this.bridge?.handleBargeIn({ audioPlaybackActive: true, force: true });
-      this.clearOutputAudio("forced-agent-consult");
     }
     pending.recent.handledByForcedPlayback = true;
     try {

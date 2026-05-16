@@ -30,6 +30,16 @@ export class CommandLaneTaskTimeoutError extends Error {
   }
 }
 
+export function isCommandLaneTaskTimeoutError(err: unknown, lane?: string): boolean {
+  if (!(err instanceof Error)) {
+    return false;
+  }
+  if (!(err instanceof CommandLaneTaskTimeoutError || err.name === "CommandLaneTaskTimeoutError")) {
+    return false;
+  }
+  return lane === undefined || err.message.includes(`Command lane "${lane}" task timed out`);
+}
+
 /**
  * Dedicated error type thrown when a new command is rejected because the
  * gateway is currently draining for restart.
@@ -53,6 +63,7 @@ type QueueEntry = {
   enqueuedAt: number;
   warnAfterMs: number;
   taskTimeoutMs?: number;
+  taskTimeoutProgressAtMs?: () => number | undefined;
   onWait?: (waitMs: number, queuedAhead: number) => void;
 };
 
@@ -200,14 +211,33 @@ async function runQueueEntryTask(lane: string, entry: QueueEntry): Promise<unkno
     return await taskPromise;
   }
 
+  const startedAtMs = Date.now();
+  const readLastProgressAtMs = () => {
+    let value: number | undefined;
+    try {
+      value = entry.taskTimeoutProgressAtMs?.();
+    } catch (err) {
+      diag.warn(`lane task timeout progress callback failed: lane=${lane} error="${String(err)}"`);
+    }
+    return typeof value === "number" && Number.isFinite(value) && value > 0
+      ? Math.max(startedAtMs, Math.floor(value))
+      : startedAtMs;
+  };
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
   let timedOut = false;
   const timeoutPromise = new Promise<never>((_, reject) => {
-    timeoutHandle = setTimeout(() => {
-      timedOut = true;
-      reject(new CommandLaneTaskTimeoutError(lane, taskTimeoutMs));
-    }, taskTimeoutMs);
-    timeoutHandle.unref?.();
+    const armTimeout = () => {
+      const elapsedMs = Math.max(0, Date.now() - readLastProgressAtMs());
+      const remainingMs = taskTimeoutMs - elapsedMs;
+      if (remainingMs <= 0) {
+        timedOut = true;
+        reject(new CommandLaneTaskTimeoutError(lane, taskTimeoutMs));
+        return;
+      }
+      timeoutHandle = setTimeout(armTimeout, remainingMs);
+      timeoutHandle.unref?.();
+    };
+    armTimeout();
   });
 
   try {
@@ -339,6 +369,7 @@ export function enqueueCommandInLane<T>(
       enqueuedAt: Date.now(),
       warnAfterMs,
       taskTimeoutMs: normalizeTaskTimeoutMs(opts?.taskTimeoutMs),
+      taskTimeoutProgressAtMs: opts?.taskTimeoutProgressAtMs,
       onWait: opts?.onWait,
     });
     logLaneEnqueue(cleaned, getLaneDepth(state));

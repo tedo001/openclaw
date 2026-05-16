@@ -14,12 +14,7 @@ describe("website installer sync workflow", () => {
   const workflow = readFileSync(WORKFLOW_PATH, "utf8");
 
   it("treats all website installer scripts as OpenClaw-owned inputs", () => {
-    for (const path of [
-      "scripts/install.sh",
-      "scripts/install-cli.sh",
-      "scripts/install.ps1",
-      "scripts/install.cmd",
-    ]) {
+    for (const path of ["scripts/install.sh", "scripts/install-cli.sh", "scripts/install.ps1"]) {
       expect(workflow).toContain(path);
       expect(detectInstallSmokeScope([path]).runFullInstallSmoke).toBe(true);
     }
@@ -40,20 +35,22 @@ describe("website installer sync workflow", () => {
     expect(workflow).toContain("windows-installer:");
     expect(workflow).toContain("runs-on: windows-latest");
     expect(workflow).toContain(".\\scripts\\install.ps1 -DryRun");
-    expect(workflow).toContain("OPENCLAW_INSTALL_PS1_URL=%GITHUB_WORKSPACE%\\scripts\\install.ps1");
-    expect(workflow).toContain(".\\scripts\\install.cmd --dry-run");
+    expect(workflow).not.toContain("install.cmd dry run");
+    expect(workflow).not.toContain(".\\scripts\\install.cmd");
   });
 
   it("syncs verified scripts to openclaw.ai only after all installer checks pass", () => {
     expect(workflow).toContain("needs: [static, linux-docker, macos-installer, windows-installer]");
     expect(workflow).toContain("repository: openclaw/openclaw.ai");
-    expect(workflow).toContain("token: ${{ secrets.OPENCLAW_GH_TOKEN }}");
+    expect(workflow).toContain("OPENCLAW_GH_TOKEN: ${{ secrets.OPENCLAW_GH_TOKEN }}");
+    expect(workflow).toContain("OPENCLAW_GH_TOKEN is not configured");
+    expect(workflow).toContain("token: ${{ env.OPENCLAW_GH_TOKEN }}");
     expect(workflow).toContain("cp openclaw/scripts/install.sh openclaw.ai/public/install.sh");
     expect(workflow).toContain(
       "cp openclaw/scripts/install-cli.sh openclaw.ai/public/install-cli.sh",
     );
     expect(workflow).toContain("cp openclaw/scripts/install.ps1 openclaw.ai/public/install.ps1");
-    expect(workflow).toContain("cp openclaw/scripts/install.cmd openclaw.ai/public/install.cmd");
+    expect(workflow).toContain("rm -f openclaw.ai/public/install.cmd");
     expect(workflow).toContain("bun run build");
     expect(workflow).toContain("git push origin HEAD:main");
   });

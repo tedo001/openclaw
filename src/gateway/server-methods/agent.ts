@@ -4,6 +4,10 @@ import {
   resolveDefaultAgentId,
   resolveAgentWorkspaceDir,
 } from "../../agents/agent-scope.js";
+import {
+  consumeExecApprovalFollowupRuntimeHandoff,
+  parseExecApprovalFollowupApprovalId,
+} from "../../agents/bash-tools.exec-approval-followup-state.js";
 import { isTimeoutError } from "../../agents/failover-error.js";
 import {
   resolveAgentAvatar,
@@ -12,6 +16,7 @@ import {
 import { AGENT_INTERNAL_EVENT_TYPE_TASK_COMPLETION } from "../../agents/internal-event-contract.js";
 import type { AgentInternalEvent } from "../../agents/internal-events.js";
 import { resolveTrustedGroupId } from "../../agents/pi-tools.policy.js";
+import { resolveProviderIdForAuth } from "../../agents/provider-auth-aliases.js";
 import { resolveSandboxConfigForAgent } from "../../agents/sandbox/config.js";
 import {
   normalizeSpawnedRunMetadata,
@@ -91,7 +96,11 @@ import {
   normalizeMessageChannel,
 } from "../../utils/message-channel.js";
 import { resolveAssistantIdentity } from "../assistant-identity.js";
-import { registerChatAbortController, resolveAgentRunExpiresAtMs } from "../chat-abort.js";
+import {
+  registerChatAbortController,
+  resolveAgentRunExpiresAtMs,
+  updateChatRunProvider,
+} from "../chat-abort.js";
 import {
   MediaOffloadError,
   parseMessageWithAttachments,
@@ -99,7 +108,11 @@ import {
 } from "../chat-attachments.js";
 import { resolveAssistantAvatarUrl } from "../control-ui-shared.js";
 import { ADMIN_SCOPE } from "../method-scopes.js";
-import { GATEWAY_CLIENT_CAPS, hasGatewayClientCap } from "../protocol/client-info.js";
+import {
+  GATEWAY_CLIENT_CAPS,
+  GATEWAY_CLIENT_MODES,
+  hasGatewayClientCap,
+} from "../protocol/client-info.js";
 import {
   ErrorCodes,
   errorShape,
@@ -173,6 +186,12 @@ function resolveAllowModelOverrideFromClient(
 
 function resolveCanResetSessionFromClient(client: GatewayRequestHandlerOptions["client"]): boolean {
   return resolveSenderIsOwnerFromClient(client);
+}
+
+function resolveCanUseInternalRuntimeHandoff(
+  client: GatewayRequestHandlerOptions["client"],
+): boolean {
+  return client?.connect?.client?.mode === GATEWAY_CLIENT_MODES.BACKEND;
 }
 
 async function runSessionResetFromAgent(params: {
@@ -582,8 +601,10 @@ export const agentHandlers: GatewayRequestHandlers = {
       bootstrapContextMode?: "full" | "lightweight";
       bootstrapContextRunKind?: "default" | "heartbeat" | "cron";
       acpTurnSource?: "manual_spawn";
+      internalRuntimeHandoffId?: string;
       internalEvents?: AgentInternalEvent[];
       idempotencyKey: string;
+      sourceReplyDeliveryMode?: "automatic" | "message_tool_only";
       timeout?: number;
       bestEffortDeliver?: boolean;
       cleanupBundleMcpOnRunEnd?: boolean;
@@ -595,6 +616,7 @@ export const agentHandlers: GatewayRequestHandlers = {
     const senderIsOwner = resolveSenderIsOwnerFromClient(client);
     const allowModelOverride = resolveAllowModelOverrideFromClient(client);
     const canResetSession = resolveCanResetSessionFromClient(client);
+    const canUseInternalRuntimeHandoff = resolveCanUseInternalRuntimeHandoff(client);
     const requestedModelOverride = Boolean(request.provider || request.model);
     const isRawModelRun = request.modelRun === true || request.promptMode === "none";
     if (requestedModelOverride && !allowModelOverride) {
@@ -612,6 +634,18 @@ export const agentHandlers: GatewayRequestHandlers = {
     const modelOverride = allowModelOverride ? request.model : undefined;
     const cfg = context.getRuntimeConfig();
     const idem = request.idempotencyKey;
+    const execApprovalFollowupApprovalId = parseExecApprovalFollowupApprovalId(idem);
+    if (execApprovalFollowupApprovalId && !canUseInternalRuntimeHandoff) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          "exec approval followup idempotency keys are reserved for backend callers.",
+        ),
+      );
+      return;
+    }
     const normalizedSpawned = normalizeSpawnedRunMetadata({
       groupId: request.groupId,
       groupChannel: request.groupChannel,
@@ -1272,7 +1306,7 @@ export const agentHandlers: GatewayRequestHandlers = {
 
     const normalizedTurnSource = normalizeMessageChannel(turnSourceChannel);
     const turnSourceMessageChannel =
-      normalizedTurnSource && isGatewayMessageChannel(normalizedTurnSource)
+      normalizedTurnSource && isKnownGatewayChannel(normalizedTurnSource)
         ? normalizedTurnSource
         : undefined;
     const originMessageChannel =
@@ -1291,6 +1325,18 @@ export const agentHandlers: GatewayRequestHandlers = {
       cfg: cfgForAgent ?? cfg,
       overrideSeconds: typeof request.timeout === "number" ? request.timeout : undefined,
     });
+    const activeModelProvider =
+      providerOverride ??
+      resolveSessionModelRef(
+        cfgForAgent ?? cfg,
+        sessionEntry,
+        resolvedSessionKey
+          ? resolveAgentIdFromSessionKey(resolvedSessionKey)
+          : (agentId ?? resolveDefaultAgentId(cfgForAgent ?? cfg)),
+      ).provider;
+    const activeAuthProvider = resolveProviderIdForAuth(activeModelProvider, {
+      config: cfgForAgent ?? cfg,
+    });
     const activeRunAbort = registerChatAbortController({
       chatAbortControllers: context.chatAbortControllers,
       runId,
@@ -1302,6 +1348,8 @@ export const agentHandlers: GatewayRequestHandlers = {
       ownerConnId: typeof client?.connId === "string" ? client.connId : undefined,
       ownerDeviceId:
         typeof client?.connect?.device?.id === "string" ? client.connect.device.id : undefined,
+      providerId: activeModelProvider,
+      authProviderId: activeAuthProvider,
       kind: "agent",
     });
     if (!activeRunAbort.registered && context.chatAbortControllers.has(runId)) {
@@ -1391,6 +1439,31 @@ export const agentHandlers: GatewayRequestHandlers = {
           (!resolvedSessionKey || resolveAgentIdFromSessionKey(resolvedSessionKey) === agentId)
             ? agentId
             : undefined;
+        let execApprovalFollowupRuntimeHandoff =
+          canUseInternalRuntimeHandoff && execApprovalFollowupApprovalId
+            ? consumeExecApprovalFollowupRuntimeHandoff({
+                handoffId: request.internalRuntimeHandoffId,
+                approvalId: execApprovalFollowupApprovalId,
+                idempotencyKey: idem,
+                sessionKey: resolvedSessionKey,
+              })
+            : undefined;
+        if (
+          !execApprovalFollowupRuntimeHandoff &&
+          canUseInternalRuntimeHandoff &&
+          execApprovalFollowupApprovalId &&
+          requestedSessionKeyRaw &&
+          requestedSessionKeyRaw !== resolvedSessionKey
+        ) {
+          execApprovalFollowupRuntimeHandoff = consumeExecApprovalFollowupRuntimeHandoff({
+            handoffId: request.internalRuntimeHandoffId,
+            approvalId: execApprovalFollowupApprovalId,
+            idempotencyKey: idem,
+            sessionKey: requestedSessionKeyRaw,
+          });
+        }
+        const execApprovalFollowupElevatedDefaults =
+          execApprovalFollowupRuntimeHandoff?.bashElevated;
 
         dispatchAgentRunFromGateway({
           ingressOpts: {
@@ -1417,6 +1490,9 @@ export const agentHandlers: GatewayRequestHandlers = {
               groupSpace: resolvedGroupSpace,
               currentThreadTs: resolvedThreadId != null ? String(resolvedThreadId) : undefined,
             },
+            ...(execApprovalFollowupElevatedDefaults
+              ? { bashElevated: execApprovalFollowupElevatedDefaults }
+              : {}),
             groupId: resolvedGroupId,
             groupChannel: resolvedGroupChannel,
             groupSpace: resolvedGroupSpace,
@@ -1434,12 +1510,22 @@ export const agentHandlers: GatewayRequestHandlers = {
             acpTurnSource: request.acpTurnSource,
             internalEvents: request.internalEvents,
             inputProvenance,
+            sourceReplyDeliveryMode: request.sourceReplyDeliveryMode,
             suppressPromptPersistence: shouldSuppressAgentPromptPersistence({
               inputProvenance,
               internalEvents: request.internalEvents,
             }),
             cleanupBundleMcpOnRunEnd: request.cleanupBundleMcpOnRunEnd,
             abortSignal: activeRunAbort.controller.signal,
+            onActiveModelSelected: ({ provider }) => {
+              updateChatRunProvider(context.chatAbortControllers, {
+                runId,
+                providerId: provider,
+                authProviderId: resolveProviderIdForAuth(provider, {
+                  config: cfgForAgent ?? cfg,
+                }),
+              });
+            },
             // Internal-only: allow workspace override for spawned subagent runs.
             workspaceDir: resolveIngressWorkspaceOverrideForSpawnedRun({
               spawnedBy: spawnedByValue,

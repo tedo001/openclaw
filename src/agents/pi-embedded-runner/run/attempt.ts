@@ -1,15 +1,12 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import {
-  createAgentSession,
-  DefaultResourceLoader,
-  SessionManager,
-} from "@mariozechner/pi-coding-agent";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import { isAcpRuntimeSpawnAvailable } from "../../../acp/runtime/availability.js";
 import { buildHierarchyReinforcementMessage } from "../../../auto-reply/handoff-summarizer.js";
 import { filterHeartbeatPairs } from "../../../auto-reply/heartbeat-filter.js";
+import { stripInboundMetadata } from "../../../auto-reply/reply/strip-inbound-meta.js";
 import { getRuntimeConfig } from "../../../config/config.js";
 import { resolveStorePath } from "../../../config/sessions/paths.js";
 import {
@@ -84,6 +81,14 @@ import {
   resolveChannelMessageToolHints,
   resolveChannelReactionGuidance,
 } from "../../channel-tools.js";
+import {
+  addClientToolsToCodeModeCatalog,
+  applyCodeModeCatalog,
+  CODE_MODE_EXEC_TOOL_NAME,
+  CODE_MODE_WAIT_TOOL_NAME,
+  createCodeModeTools,
+  resolveCodeModeConfig,
+} from "../../code-mode.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../../defaults.js";
 import { resolveOpenClawReferencePaths } from "../../docs-path.js";
 import { isTimeoutError } from "../../failover-error.js";
@@ -129,6 +134,7 @@ import {
 import {
   resolveEffectiveToolPolicy,
   resolveGroupToolPolicy,
+  resolveInheritedToolPolicyForSession,
   resolveSubagentToolPolicyForSession,
 } from "../../pi-tools.policy.js";
 import { wrapStreamFnTextTransforms } from "../../plugin-text-transforms.js";
@@ -174,9 +180,25 @@ import {
   collectExplicitToolAllowlistSources,
 } from "../../tool-allowlist-guard.js";
 import { UNKNOWN_TOOL_THRESHOLD } from "../../tool-loop-detection.js";
+import { normalizeToolName } from "../../tool-policy.js";
+import {
+  addClientToolsToToolSearchCatalog,
+  applyToolSearchCatalog,
+  clearToolSearchCatalog,
+  createToolSearchCatalogRef,
+  projectToolSearchTargetTranscriptMessages,
+  resolveToolSearchConfig,
+  TOOL_CALL_RAW_TOOL_NAME,
+  TOOL_DESCRIBE_RAW_TOOL_NAME,
+  TOOL_SEARCH_CODE_MODE_TOOL_NAME,
+  TOOL_SEARCH_RAW_TOOL_NAME,
+  type ToolSearchCatalogRef,
+  type ToolSearchCatalogToolExecutor,
+  type ToolSearchTargetTranscriptProjection,
+} from "../../tool-search.js";
 import { shouldAllowProviderOwnedThinkingReplay } from "../../transcript-policy.js";
 import { normalizeUsage, type NormalizedUsage } from "../../usage.js";
-import { DEFAULT_BOOTSTRAP_FILENAME } from "../../workspace.js";
+import { DEFAULT_BOOTSTRAP_FILENAME, type WorkspaceBootstrapFile } from "../../workspace.js";
 import { isRunnerAbortError } from "../abort.js";
 import { isCacheTtlEligibleProvider, readLastCacheTtlTimestamp } from "../cache-ttl.js";
 import { resolveCompactionTimeoutMs } from "../compaction-safety-timeout.js";
@@ -207,6 +229,7 @@ import {
   validateReplayTurns,
 } from "../replay-history.js";
 import { observeReplayMetadata, replayMetadataFromState } from "../replay-state.js";
+import { createEmbeddedPiResourceLoader } from "../resource-loader.js";
 import {
   clearActiveEmbeddedRun,
   type EmbeddedPiQueueHandle,
@@ -228,6 +251,7 @@ import { applySystemPromptOverrideToSession } from "../system-prompt.js";
 import { dropReasoningFromHistory, dropThinkingBlocks } from "../thinking.js";
 import {
   collectAllowedToolNames,
+  collectCoreBuiltinToolNames,
   collectRegisteredToolNames,
   PI_RESERVED_TOOL_NAMES,
   toSessionToolAllowlist,
@@ -247,6 +271,7 @@ import { abortable as abortableWithSignal } from "./abortable.js";
 import { createEmbeddedAgentSessionWithResourceLoader } from "./attempt-session.js";
 import {
   applyEmbeddedAttemptToolsAllow,
+  mergeForcedEmbeddedAttemptToolsAllow,
   resolveEmbeddedAttemptToolConstructionPlan,
   shouldCreateBundleLspRuntimeForAttempt,
   shouldCreateBundleMcpRuntimeForAttempt,
@@ -345,7 +370,7 @@ import {
   shouldPreemptivelyCompactBeforePrompt,
 } from "./preemptive-compaction.js";
 import {
-  buildCurrentTurnPromptContextPrefix,
+  buildCurrentTurnPrompt,
   buildRuntimeContextSystemContext,
   queueRuntimeContextForNextTurn,
   resolveRuntimeContextPromptParts,
@@ -389,6 +414,123 @@ export {
 };
 
 const MAX_BTW_SNAPSHOT_MESSAGES = 100;
+const TOOL_SEARCH_CONTROL_ALLOWLIST_NAMES = [
+  TOOL_SEARCH_CODE_MODE_TOOL_NAME,
+  TOOL_SEARCH_RAW_TOOL_NAME,
+  TOOL_DESCRIBE_RAW_TOOL_NAME,
+  TOOL_CALL_RAW_TOOL_NAME,
+];
+
+export function buildCallableToolNamesForEmptyAllowlistCheck(params: {
+  effectiveToolNames: string[];
+  autoAddedToolSearchControlNames?: Set<string>;
+  toolSearchCatalogToolCount: number;
+}): string[] {
+  return [
+    ...params.effectiveToolNames.filter(
+      (toolName) => !params.autoAddedToolSearchControlNames?.has(toolName),
+    ),
+    ...Array.from(
+      { length: params.toolSearchCatalogToolCount },
+      (_, index) => `tool-search:${index}`,
+    ),
+  ];
+}
+
+export function buildAutoAddedToolSearchControlNamesForAllowlistCheck(params: {
+  toolSearchControlsEnabled: boolean;
+  explicitAllowlistSources: Array<{ entries: string[] }>;
+  controlNames?: readonly string[];
+}): Set<string> | undefined {
+  if (!params.toolSearchControlsEnabled) {
+    return undefined;
+  }
+  const explicitlyAllowed = new Set(
+    params.explicitAllowlistSources.flatMap((source) =>
+      source.entries.map((entry) => normalizeToolName(entry)),
+    ),
+  );
+  return new Set(
+    (params.controlNames ?? TOOL_SEARCH_CONTROL_ALLOWLIST_NAMES).filter(
+      (controlName) => !explicitlyAllowed.has(normalizeToolName(controlName)),
+    ),
+  );
+}
+
+export type ToolSearchRunPlan = {
+  visibleAllowedToolNames: Set<string>;
+  replayAllowedToolNames: Set<string>;
+  autoAddedControlNames?: Set<string>;
+  emptyAllowlistCallableNames: string[];
+};
+
+type CollectAllowedToolNamesParams = Parameters<typeof collectAllowedToolNames>[0];
+
+function collectExplicitlyAllowedClientToolNames(params: {
+  clientTools?: CollectAllowedToolNamesParams["clientTools"];
+  explicitAllowlistSources: Array<{ entries: string[] }>;
+}): string[] {
+  const explicitNames = new Set(
+    params.explicitAllowlistSources.flatMap((source) =>
+      source.entries.map((entry) => normalizeToolName(entry)),
+    ),
+  );
+  return (params.clientTools ?? [])
+    .map((tool) => tool.function?.name)
+    .filter((name): name is string => Boolean(name?.trim()))
+    .filter((name) => explicitNames.has(normalizeToolName(name)));
+}
+
+export function buildToolSearchRunPlan(params: {
+  visibleTools: CollectAllowedToolNamesParams["tools"];
+  uncompactedTools: CollectAllowedToolNamesParams["tools"];
+  clientTools?: CollectAllowedToolNamesParams["clientTools"];
+  catalogRegistered: boolean;
+  catalogToolCount: number;
+  controlsEnabled: boolean;
+  controlNames?: readonly string[];
+  explicitAllowlistSources: Array<{ entries: string[] }>;
+}): ToolSearchRunPlan {
+  const visibleAllowedToolNames = collectAllowedToolNames({
+    tools: params.visibleTools,
+    clientTools: params.catalogRegistered ? undefined : params.clientTools,
+  });
+  const replayAllowedToolNames = collectAllowedToolNames({
+    tools: params.uncompactedTools,
+    clientTools: params.clientTools,
+  });
+  if (params.controlsEnabled) {
+    for (const controlName of params.controlNames ?? TOOL_SEARCH_CONTROL_ALLOWLIST_NAMES) {
+      if (visibleAllowedToolNames.has(controlName)) {
+        replayAllowedToolNames.add(controlName);
+      }
+    }
+  }
+  const autoAddedControlNames = buildAutoAddedToolSearchControlNamesForAllowlistCheck({
+    toolSearchControlsEnabled: params.controlsEnabled,
+    explicitAllowlistSources: params.explicitAllowlistSources,
+    controlNames: params.controlNames,
+  });
+  const clientCatalogCallableNames = params.catalogRegistered
+    ? collectExplicitlyAllowedClientToolNames({
+        clientTools: params.clientTools,
+        explicitAllowlistSources: params.explicitAllowlistSources,
+      }).map((name) => `tool-search-client:${name}`)
+    : [];
+  return {
+    visibleAllowedToolNames,
+    replayAllowedToolNames,
+    autoAddedControlNames,
+    emptyAllowlistCallableNames: [
+      ...buildCallableToolNamesForEmptyAllowlistCheck({
+        effectiveToolNames: [...visibleAllowedToolNames],
+        autoAddedToolSearchControlNames: autoAddedControlNames,
+        toolSearchCatalogToolCount: params.catalogToolCount,
+      }),
+      ...clientCatalogCallableNames,
+    ],
+  };
+}
 
 export function resolveUnknownToolGuardThreshold(loopDetection?: {
   enabled?: boolean;
@@ -414,6 +556,15 @@ export function isPrimaryBootstrapRun(sessionKey?: string): boolean {
   return !isSubagentSessionKey(sessionKey) && !isAcpSessionKey(sessionKey);
 }
 
+function isRelativePathInsideOrEqual(relativePath: string): boolean {
+  return (
+    relativePath === "" ||
+    (relativePath !== ".." &&
+      !relativePath.startsWith(`..${path.sep}`) &&
+      !path.isAbsolute(relativePath))
+  );
+}
+
 export function remapInjectedContextFilesToWorkspace(params: {
   files: EmbeddedContextFile[];
   sourceWorkspaceDir: string;
@@ -424,7 +575,7 @@ export function remapInjectedContextFilesToWorkspace(params: {
   }
   return params.files.map((file) => {
     const relative = path.relative(params.sourceWorkspaceDir, file.path);
-    const canRemap = relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+    const canRemap = isRelativePathInsideOrEqual(relative);
     return canRemap
       ? {
           ...file,
@@ -502,7 +653,52 @@ function summarizeSessionContext(messages: AgentMessage[]): {
 
 export function normalizeMessagesForLlmBoundary(messages: AgentMessage[]): AgentMessage[] {
   const normalized = stripToolResultDetails(normalizeAssistantReplayContent(messages));
-  return stripHistoricalRuntimeContextCustomMessages(normalized);
+  const withoutHistoricalInboundMetadata =
+    stripHistoricalInboundMetadataFromUserMessages(normalized);
+  return stripHistoricalRuntimeContextCustomMessages(withoutHistoricalInboundMetadata);
+}
+
+function stripHistoricalInboundMetadataFromUserMessages(messages: AgentMessage[]): AgentMessage[] {
+  let changed = false;
+  const nextMessages = messages.map((message) => {
+    if (message.role !== "user") {
+      return message;
+    }
+    const content = (message as { content?: unknown }).content;
+    if (typeof content === "string") {
+      const stripped = stripInboundMetadata(content);
+      if (stripped === content) {
+        return message;
+      }
+      changed = true;
+      return { ...message, content: stripped } as AgentMessage;
+    }
+    if (!Array.isArray(content)) {
+      return message;
+    }
+    let contentChanged = false;
+    const nextContent = content.map((block) => {
+      if (!block || typeof block !== "object") {
+        return block;
+      }
+      const textBlock = block as { type?: unknown; text?: unknown };
+      if (textBlock.type !== "text" || typeof textBlock.text !== "string") {
+        return block;
+      }
+      const stripped = stripInboundMetadata(textBlock.text);
+      if (stripped === textBlock.text) {
+        return block;
+      }
+      contentChanged = true;
+      return Object.assign({}, block, { text: stripped });
+    });
+    if (!contentChanged) {
+      return message;
+    }
+    changed = true;
+    return { ...message, content: nextContent } as AgentMessage;
+  });
+  return changed ? nextMessages : messages;
 }
 
 function cloneHookMessages(messages: AgentMessage[]): AgentMessage[] {
@@ -641,6 +837,13 @@ function collectAttemptExplicitToolAllowlistSources(params: {
           store: subagentStore,
         })
       : undefined;
+  const inheritedToolPolicy = resolveInheritedToolPolicyForSession(
+    params.config,
+    params.sandboxSessionKey,
+    {
+      store: subagentStore,
+    },
+  );
   return collectExplicitToolAllowlistSources([
     { label: "tools.allow", allow: globalPolicy?.allow },
     { label: "tools.byProvider.allow", allow: globalProviderPolicy?.allow },
@@ -655,6 +858,7 @@ function collectAttemptExplicitToolAllowlistSources(params: {
     { label: "group tools.allow", allow: groupPolicy?.allow },
     { label: "sandbox tools.allow", allow: params.sandboxToolPolicy?.allow },
     { label: "subagent tools.allow", allow: subagentPolicy?.allow },
+    { label: "inherited tools.allow", allow: inheritedToolPolicy?.allow },
     { label: "runtime toolsAllow", allow: params.toolsAllow, enforceWhenToolsDisabled: true },
   ]);
 }
@@ -783,7 +987,7 @@ export async function runEmbeddedAttempt(
     prepStages.mark("skills");
 
     const sessionLabel = params.sessionKey ?? params.sessionId;
-    const contextInjectionMode = resolveContextInjectionMode(params.config);
+    const contextInjectionMode = resolveContextInjectionMode(params.config, sessionAgentId);
     const isRawModelRun = params.modelRun === true || params.promptMode === "none";
     if (isRawModelRun && log.isEnabled("debug")) {
       log.debug(
@@ -832,12 +1036,54 @@ export async function runEmbeddedAttempt(
       });
     };
     const corePluginToolStages = createEmbeddedRunStageTracker();
+    const toolsAllowWithForcedRuntimeTools = mergeForcedEmbeddedAttemptToolsAllow(
+      params.toolsAllow,
+      {
+        forceMessageTool:
+          params.forceMessageTool === true ||
+          params.sourceReplyDeliveryMode === "message_tool_only",
+      },
+    );
     const toolConstructionPlan = resolveEmbeddedAttemptToolConstructionPlan({
       disableTools: params.disableTools,
       isRawModelRun,
-      toolsAllow: params.toolsAllow,
+      toolsAllow: toolsAllowWithForcedRuntimeTools,
     });
-    const toolsRaw = !toolConstructionPlan.constructTools
+    const toolsEnabled = supportsModelTools(params.model);
+    const codeModeConfig = resolveCodeModeConfig(params.config);
+    const codeModeControlsEnabledForRun =
+      toolsEnabled &&
+      params.disableTools !== true &&
+      !isRawModelRun &&
+      params.toolsAllow?.length !== 0 &&
+      codeModeConfig.enabled;
+    const toolSearchControlsEnabledForRun =
+      toolsEnabled &&
+      params.disableTools !== true &&
+      !isRawModelRun &&
+      params.toolsAllow?.length !== 0 &&
+      !codeModeControlsEnabledForRun &&
+      resolveToolSearchConfig(params.config).enabled;
+    const effectiveToolsAllow =
+      toolSearchControlsEnabledForRun && toolsAllowWithForcedRuntimeTools
+        ? [
+            ...new Set([
+              ...toolsAllowWithForcedRuntimeTools,
+              ...TOOL_SEARCH_CONTROL_ALLOWLIST_NAMES,
+            ]),
+          ]
+        : toolsAllowWithForcedRuntimeTools;
+    const shouldConstructTools =
+      toolConstructionPlan.constructTools ||
+      toolSearchControlsEnabledForRun ||
+      codeModeControlsEnabledForRun;
+    let toolSearchCatalogExecutor: ToolSearchCatalogToolExecutor | undefined;
+    const toolSearchCatalogRef: ToolSearchCatalogRef | undefined =
+      toolSearchControlsEnabledForRun || codeModeControlsEnabledForRun
+        ? createToolSearchCatalogRef()
+        : undefined;
+    const toolSearchTargetTranscriptProjections: ToolSearchTargetTranscriptProjection[] = [];
+    const toolsRaw = !shouldConstructTools
       ? []
       : (() => {
           const allTools = createOpenClawCodingTools({
@@ -874,6 +1120,7 @@ export async function runEmbeddedAttempt(
                 : undefined,
             sessionId: params.sessionId,
             runId: params.runId,
+            toolSearchCatalogRef,
             agentDir,
             workspaceDir: effectiveWorkspace,
             // When sandboxing uses a copied workspace (`ro` or `none`), effectiveWorkspace points
@@ -896,6 +1143,13 @@ export async function runEmbeddedAttempt(
             currentThreadTs: params.currentThreadTs,
             currentMessageId: params.currentMessageId,
             includeCoreTools: toolConstructionPlan.includeCoreTools,
+            includeToolSearchControls: toolSearchControlsEnabledForRun,
+            toolSearchCatalogExecutor: (toolParams) => {
+              if (!toolSearchCatalogExecutor) {
+                throw new Error("Tool Search catalog executor is unavailable for this run.");
+              }
+              return toolSearchCatalogExecutor(toolParams);
+            },
             toolConstructionPlan: toolConstructionPlan.codingToolConstructionPlan,
             replyToMode: params.replyToMode,
             hasRepliedRef: params.hasRepliedRef,
@@ -903,6 +1157,7 @@ export async function runEmbeddedAttempt(
             requireExplicitMessageTarget:
               params.requireExplicitMessageTarget ?? isSubagentSessionKey(params.sessionKey),
             sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
+            inboundTurnKind: params.currentTurnKind,
             disableMessageTool: params.disableMessageTool,
             forceMessageTool: params.forceMessageTool,
             enableHeartbeatTool: params.enableHeartbeatTool,
@@ -919,7 +1174,7 @@ export async function runEmbeddedAttempt(
             },
           });
           corePluginToolStages.mark("attempt:create-openclaw-coding-tools");
-          const filteredTools = applyEmbeddedAttemptToolsAllow(allTools, params.toolsAllow, {
+          const filteredTools = applyEmbeddedAttemptToolsAllow(allTools, effectiveToolsAllow, {
             toolMeta: (tool) => getPluginToolMeta(tool),
           });
           corePluginToolStages.mark("attempt:tools-allow");
@@ -927,37 +1182,57 @@ export async function runEmbeddedAttempt(
         })();
     prepStages.mark("core-plugin-tools");
     emitCorePluginToolStageSummary("core-plugin-tools", corePluginToolStages.snapshot());
-    const toolsEnabled = supportsModelTools(params.model);
     const bootstrapHasFileAccess = toolsEnabled && toolsRaw.some((tool) => tool.name === "read");
     const bootstrapWarn = makeBootstrapWarn({
       sessionLabel,
       workspaceDir: resolvedWorkspace,
       warn: (message) => log.warn(message),
     });
-    const preloadedBootstrapFiles =
-      isRawModelRun || contextInjectionMode === "never"
-        ? undefined
-        : await resolveBootstrapFilesForRun({
-            workspaceDir: resolvedWorkspace,
-            config: params.config,
-            sessionKey: params.sessionKey,
-            sessionId: params.sessionId,
-            warn: bootstrapWarn,
-            contextMode: params.bootstrapContextMode,
-            runKind: params.bootstrapContextRunKind,
-          });
-    const bootstrapRouting = await resolveAttemptWorkspaceBootstrapRouting({
-      isWorkspaceBootstrapPending,
-      bootstrapFiles: preloadedBootstrapFiles,
-      bootstrapContextRunKind: params.bootstrapContextRunKind,
-      trigger: params.trigger,
-      sessionKey: params.sessionKey,
-      isPrimaryRun: isPrimaryBootstrapRun(params.sessionKey),
-      isCanonicalWorkspace: params.isCanonicalWorkspace,
-      effectiveWorkspace,
-      resolvedWorkspace,
-      hasBootstrapFileAccess: bootstrapHasFileAccess,
-    });
+    let completedBootstrapTurn: boolean | undefined;
+    const hasCompletedBootstrapTurnForAttempt = async (sessionFile: string) => {
+      completedBootstrapTurn ??= await hasCompletedBootstrapTurn(sessionFile);
+      return completedBootstrapTurn;
+    };
+    const resolveBootstrapRouting = (bootstrapFiles?: readonly WorkspaceBootstrapFile[]) =>
+      resolveAttemptWorkspaceBootstrapRouting({
+        isWorkspaceBootstrapPending,
+        bootstrapFiles,
+        bootstrapContextRunKind: params.bootstrapContextRunKind,
+        trigger: params.trigger,
+        sessionKey: params.sessionKey,
+        isPrimaryRun: isPrimaryBootstrapRun(params.sessionKey),
+        isCanonicalWorkspace: params.isCanonicalWorkspace,
+        effectiveWorkspace,
+        resolvedWorkspace,
+        hasBootstrapFileAccess: bootstrapHasFileAccess,
+      });
+    const shouldProbeContinuationSkip =
+      !isRawModelRun &&
+      contextInjectionMode === "continuation-skip" &&
+      (params.bootstrapContextRunKind ?? "default") !== "heartbeat" &&
+      (await hasCompletedBootstrapTurnForAttempt(params.sessionFile));
+    let preloadedBootstrapFiles: WorkspaceBootstrapFile[] | undefined;
+    let bootstrapRouting =
+      shouldProbeContinuationSkip || isRawModelRun || contextInjectionMode === "never"
+        ? await resolveBootstrapRouting()
+        : undefined;
+    if (
+      !isRawModelRun &&
+      contextInjectionMode !== "never" &&
+      (bootstrapRouting === undefined || bootstrapRouting.bootstrapMode === "full")
+    ) {
+      preloadedBootstrapFiles = await resolveBootstrapFilesForRun({
+        workspaceDir: resolvedWorkspace,
+        config: params.config,
+        sessionKey: params.sessionKey,
+        sessionId: params.sessionId,
+        warn: bootstrapWarn,
+        contextMode: params.bootstrapContextMode,
+        runKind: params.bootstrapContextRunKind,
+      });
+      bootstrapRouting = await resolveBootstrapRouting(preloadedBootstrapFiles);
+    }
+    bootstrapRouting ??= await resolveBootstrapRouting(preloadedBootstrapFiles);
     const bootstrapMode = bootstrapRouting.bootstrapMode;
     const {
       bootstrapFiles: hookAdjustedBootstrapFiles,
@@ -971,7 +1246,7 @@ export async function runEmbeddedAttempt(
       bootstrapContextRunKind: params.bootstrapContextRunKind ?? "default",
       bootstrapMode,
       sessionFile: params.sessionFile,
-      hasCompletedBootstrapTurn,
+      hasCompletedBootstrapTurn: hasCompletedBootstrapTurnForAttempt,
       resolveBootstrapContextForRun: async () => {
         const bootstrapFiles =
           preloadedBootstrapFiles ??
@@ -980,6 +1255,7 @@ export async function runEmbeddedAttempt(
             config: params.config,
             sessionKey: params.sessionKey,
             sessionId: params.sessionId,
+            agentId: sessionAgentId,
             warn: bootstrapWarn,
             contextMode: params.bootstrapContextMode,
             runKind: params.bootstrapContextRunKind,
@@ -988,6 +1264,7 @@ export async function runEmbeddedAttempt(
           bootstrapFiles,
           contextFiles: buildBootstrapContextForFiles(bootstrapFiles, {
             config: params.config,
+            agentId: sessionAgentId,
             warn: bootstrapWarn,
           }),
         };
@@ -1005,8 +1282,8 @@ export async function runEmbeddedAttempt(
     const bootstrapFilesForInjectionStats = bootstrapRouting.includeBootstrapInSystemContext
       ? hookAdjustedBootstrapFiles
       : hookAdjustedBootstrapFiles.filter((file) => file.name !== DEFAULT_BOOTSTRAP_FILENAME);
-    const bootstrapMaxChars = resolveBootstrapMaxChars(params.config);
-    const bootstrapTotalMaxChars = resolveBootstrapTotalMaxChars(params.config);
+    const bootstrapMaxChars = resolveBootstrapMaxChars(params.config, sessionAgentId);
+    const bootstrapTotalMaxChars = resolveBootstrapTotalMaxChars(params.config, sessionAgentId);
     const bootstrapAnalysis = analyzeBootstrapBudget({
       files: buildBootstrapInjectionStats({
         bootstrapFiles: bootstrapFilesForInjectionStats,
@@ -1125,12 +1402,72 @@ export async function runEmbeddedAttempt(
       ownerOnlyToolAllowlist: params.ownerOnlyToolAllowlist,
       warn: (message) => log.warn(message),
     });
-    const effectiveTools = [...tools, ...filteredBundledTools];
+    const uncompactedEffectiveTools = [...tools, ...filteredBundledTools];
+    let effectiveTools = uncompactedEffectiveTools;
+    const catalogToolHookContext = {
+      agentId: sessionAgentId,
+      config: params.config,
+      cwd: effectiveWorkspace,
+      sessionKey: sandboxSessionKey,
+      sessionId: params.sessionId,
+      runId: params.runId,
+      channelId: params.currentChannelId,
+      trace: runTrace,
+      loopDetection: resolveToolLoopDetectionConfig({
+        cfg: params.config,
+        agentId: sessionAgentId,
+      }),
+      onToolOutcome: params.onToolOutcome,
+    };
+    const codeModeTools = codeModeControlsEnabledForRun
+      ? createCodeModeTools({
+          config: params.config,
+          runtimeConfig: params.config,
+          agentId: sessionAgentId,
+          sessionKey: sandboxSessionKey,
+          sessionId: params.sessionId,
+          runId: params.runId,
+          catalogRef: toolSearchCatalogRef,
+          abortSignal: runAbortController.signal,
+          executeTool: (toolParams) => {
+            if (!toolSearchCatalogExecutor) {
+              throw new Error("Code Mode catalog executor is unavailable for this run.");
+            }
+            return toolSearchCatalogExecutor(toolParams);
+          },
+        })
+      : [];
+    const toolSearch = codeModeControlsEnabledForRun
+      ? applyCodeModeCatalog({
+          tools: [...codeModeTools, ...effectiveTools],
+          config: params.config,
+          sessionId: params.sessionId,
+          sessionKey: sandboxSessionKey,
+          agentId: sessionAgentId,
+          runId: params.runId,
+          catalogRef: toolSearchCatalogRef,
+          toolHookContext: catalogToolHookContext,
+        })
+      : applyToolSearchCatalog({
+          tools: effectiveTools,
+          config: params.config,
+          sessionId: params.sessionId,
+          sessionKey: sandboxSessionKey,
+          agentId: sessionAgentId,
+          runId: params.runId,
+          catalogRef: toolSearchCatalogRef,
+          toolHookContext: catalogToolHookContext,
+        });
+    effectiveTools = toolSearch.tools;
+    if (toolSearch.compacted) {
+      prepStages.mark(codeModeControlsEnabledForRun ? "code-mode" : "tool-search");
+      log.info(
+        codeModeControlsEnabledForRun
+          ? `code-mode: cataloged ${toolSearch.catalogToolCount} tools behind exec/wait`
+          : `tool-search: cataloged ${toolSearch.catalogToolCount} tools behind compact prompt surface`,
+      );
+    }
     prepStages.mark("bundle-tools");
-    const allowedToolNames = collectAllowedToolNames({
-      tools: effectiveTools,
-      clientTools,
-    });
     const explicitToolAllowlistSources = collectAttemptExplicitToolAllowlistSources({
       config: params.config,
       sessionKey: params.sessionKey,
@@ -1151,9 +1488,23 @@ export async function runEmbeddedAttempt(
       sandboxToolPolicy: sandbox?.tools,
       toolsAllow: params.toolsAllow,
     });
+    const toolSearchRunPlan = buildToolSearchRunPlan({
+      visibleTools: effectiveTools,
+      uncompactedTools: uncompactedEffectiveTools,
+      clientTools,
+      catalogRegistered: toolSearch.catalogRegistered,
+      catalogToolCount: toolSearch.catalogToolCount,
+      controlsEnabled: toolSearchControlsEnabledForRun || codeModeControlsEnabledForRun,
+      controlNames: codeModeControlsEnabledForRun
+        ? [CODE_MODE_EXEC_TOOL_NAME, CODE_MODE_WAIT_TOOL_NAME]
+        : undefined,
+      explicitAllowlistSources: explicitToolAllowlistSources,
+    });
+    const allowedToolNames = toolSearchRunPlan.visibleAllowedToolNames;
+    const replayAllowedToolNames = toolSearchRunPlan.replayAllowedToolNames;
     const emptyExplicitToolAllowlistError = buildEmptyExplicitToolAllowlistError({
       sources: explicitToolAllowlistSources,
-      callableToolNames: effectiveTools.map((tool) => tool.name),
+      callableToolNames: toolSearchRunPlan.emptyAllowlistCallableNames,
       toolsEnabled,
       disableTools: params.disableTools,
     });
@@ -1413,6 +1764,7 @@ export async function runEmbeddedAttempt(
     let removeToolResultContextGuard: (() => void) | undefined;
     let trajectoryRecorder: ReturnType<typeof createTrajectoryRuntimeRecorder> | null = null;
     let trajectoryEndRecorded = false;
+    let buildAbortSettlePromise: () => Promise<void> | null = () => null;
     try {
       await repairSessionFileIfNeeded({
         sessionFile: params.sessionFile,
@@ -1447,8 +1799,10 @@ export async function runEmbeddedAttempt(
           params.model.api === "openai-codex-responses"
             ? "aborted"
             : undefined,
-        allowedToolNames,
+        allowedToolNames: replayAllowedToolNames,
         suppressNextUserMessagePersistence: params.suppressNextUserMessagePersistence,
+        suppressTranscriptOnlyAssistantPersistence:
+          params.suppressTranscriptOnlyAssistantPersistence,
         onUserMessagePersisted: (message) => {
           params.onUserMessagePersisted?.(message);
         },
@@ -1525,7 +1879,7 @@ export async function runEmbeddedAttempt(
         modelId: params.modelId,
         model: params.model,
       });
-      const resourceLoader = new DefaultResourceLoader({
+      const resourceLoader = createEmbeddedPiResourceLoader({
         cwd: resolvedWorkspace,
         agentDir,
         settingsManager,
@@ -1583,7 +1937,7 @@ export async function runEmbeddedAttempt(
       // MEDIA: passthrough gate: a normalized alias is not sufficient — the
       // emitted tool name must match an exact registration of this run.
       const builtinToolNames = new Set(
-        effectiveTools.flatMap((tool) => {
+        uncompactedEffectiveTools.flatMap((tool) => {
           const name = (tool.name ?? "").trim();
           return name ? [name] : [];
         }),
@@ -1593,15 +1947,10 @@ export async function runEmbeddedAttempt(
       // plugin tool names. MEDIA passthrough is still gated by the raw-name
       // set above, so a client tool that normalize-collides with a plugin
       // tool cannot inherit the plugin's local-media trust.
-      const coreBuiltinToolNames = new Set(
-        effectiveTools.flatMap((tool) => {
-          const name = (tool.name ?? "").trim();
-          if (!name || getPluginToolMeta(tool)) {
-            return [];
-          }
-          return [name];
-        }),
-      );
+      const coreBuiltinToolNames = collectCoreBuiltinToolNames(uncompactedEffectiveTools, {
+        isPluginTool: (tool) =>
+          Boolean(getPluginToolMeta(tool as Parameters<typeof getPluginToolMeta>[0])),
+      });
       const clientToolNameConflicts = findClientToolNameConflicts({
         tools: clientTools ?? [],
         existingToolNames: [...coreBuiltinToolNames, ...PI_RESERVED_TOOL_NAMES],
@@ -1609,7 +1958,7 @@ export async function runEmbeddedAttempt(
       if (clientToolNameConflicts.length > 0) {
         throw createClientToolNameConflictError(clientToolNameConflicts);
       }
-      const clientToolDefs = clientTools
+      let clientToolDefs = clientTools
         ? toClientToolDefinitions(
             clientTools,
             {
@@ -1651,6 +2000,33 @@ export async function runEmbeddedAttempt(
             },
           )
         : [];
+      const clientToolSearch = codeModeControlsEnabledForRun
+        ? addClientToolsToCodeModeCatalog({
+            tools: clientToolDefs,
+            config: params.config,
+            sessionId: params.sessionId,
+            sessionKey: sandboxSessionKey,
+            agentId: sessionAgentId,
+            runId: params.runId,
+            catalogRef: toolSearchCatalogRef,
+          })
+        : addClientToolsToToolSearchCatalog({
+            tools: clientToolDefs,
+            config: params.config,
+            sessionId: params.sessionId,
+            sessionKey: sandboxSessionKey,
+            agentId: sessionAgentId,
+            runId: params.runId,
+            catalogRef: toolSearchCatalogRef,
+          });
+      clientToolDefs = clientToolSearch.tools;
+      if (clientToolSearch.compacted) {
+        log.info(
+          codeModeControlsEnabledForRun
+            ? `code-mode: cataloged ${clientToolSearch.catalogToolCount} client tools behind exec/wait`
+            : `tool-search: cataloged ${clientToolSearch.catalogToolCount} client tools behind compact prompt surface`,
+        );
+      }
 
       const allCustomTools = [...customTools, ...clientToolDefs];
       // Pi treats `tools` as a name allowlist during session creation. Pass the
@@ -1706,8 +2082,38 @@ export async function runEmbeddedAttempt(
       let unwindowedContextEngineMessagesForPrecheck: AgentMessage[] | undefined;
       let contextEnginePromptAuthority: NonNullable<AssembleResult["promptAuthority"]> =
         "assembled";
+      const inFlightPromptSettlePromises = new Set<Promise<void>>();
+      const inFlightAbortSettlePromises = new Set<Promise<void>>();
+      const trackSettlePromise = (
+        promises: Set<Promise<void>>,
+        promise: Promise<void>,
+      ): Promise<void> => {
+        promises.add(promise);
+        void promise.then(
+          () => {
+            promises.delete(promise);
+          },
+          () => {
+            promises.delete(promise);
+          },
+        );
+        return promise;
+      };
+      const trackPromptSettlePromise = (promise: Promise<void>): Promise<void> =>
+        trackSettlePromise(inFlightPromptSettlePromises, promise);
+      const trackAbortSettlePromise = (promise: Promise<void>): Promise<void> =>
+        trackSettlePromise(inFlightAbortSettlePromises, promise);
+      const abortActiveSession = (): Promise<void> =>
+        trackAbortSettlePromise(Promise.resolve(activeSession.abort()));
+      buildAbortSettlePromise = (): Promise<void> | null => {
+        const promises = [...inFlightPromptSettlePromises, ...inFlightAbortSettlePromises];
+        if (promises.length === 0) {
+          return null;
+        }
+        return Promise.allSettled(promises).then(() => undefined);
+      };
       abortSessionForYield = () => {
-        yieldAbortSettled = Promise.resolve(activeSession.abort());
+        yieldAbortSettled = abortActiveSession();
       };
       queueYieldInterruptForSession = () => {
         queueSessionsYieldInterruptMessage(activeSession);
@@ -2043,7 +2449,7 @@ export async function runEmbeddedAttempt(
           const nextMessages = sanitizeReplayToolCallIdsForStream({
             messages: messages as AgentMessage[],
             mode,
-            allowedToolNames,
+            allowedToolNames: replayAllowedToolNames,
             preserveNativeAnthropicToolUseIds: transcriptPolicy.preserveNativeAnthropicToolUseIds,
             preserveReplaySafeThinkingToolCallIds: shouldAllowProviderOwnedThinkingReplay({
               modelApi: (model as { api?: unknown })?.api as string | null | undefined,
@@ -2143,14 +2549,23 @@ export async function runEmbeddedAttempt(
 
       let idleTimeoutTrigger: ((error: Error) => void) | undefined;
 
-      // Wrap stream with idle timeout detection
+      // Wrap stream with idle timeout detection.
+      //
+      // Prefer the caller's explicit `runTimeoutOverrideMs` when provided —
+      // it carries the "this run was launched with a deliberate per-run
+      // timeout" signal without losing it when the value numerically equals
+      // `agents.defaults.timeoutSeconds`. Fall back to the value-equality
+      // heuristic for callers that haven't been migrated to plumb the flag.
       const configuredRunTimeoutMs = resolveAgentTimeoutMs({
         cfg: params.config,
       });
+      const resolvedRunTimeoutMs =
+        params.runTimeoutOverrideMs ??
+        (params.timeoutMs !== configuredRunTimeoutMs ? params.timeoutMs : undefined);
       const idleTimeoutMs = resolveLlmIdleTimeoutMs({
         cfg: params.config,
         trigger: params.trigger,
-        runTimeoutMs: params.timeoutMs !== configuredRunTimeoutMs ? params.timeoutMs : undefined,
+        runTimeoutMs: resolvedRunTimeoutMs,
         modelRequestTimeoutMs: (params.model as { requestTimeoutMs?: number }).requestTimeoutMs,
         model: params.model as { baseUrl?: string },
       });
@@ -2172,8 +2587,25 @@ export async function runEmbeddedAttempt(
           model: params.modelId,
           api: params.model.api,
           transport: effectiveAgentTransport,
+          ...(params.contextWindowInfo?.tokens
+            ? { contextTokenBudget: params.contextWindowInfo.tokens }
+            : {}),
+          ...(params.contextWindowInfo?.source
+            ? { contextWindowSource: params.contextWindowInfo.source }
+            : {}),
+          ...(params.contextWindowInfo?.referenceTokens
+            ? { contextWindowReferenceTokens: params.contextWindowInfo.referenceTokens }
+            : {}),
           trace: runTrace,
           nextCallId: () => `${params.runId}:model:${(diagnosticModelCallSeq += 1)}`,
+          onStarted: () => {
+            params.onExecutionPhase?.({
+              phase: "model_call_started",
+              provider: params.provider,
+              model: params.modelId,
+              firstModelCallStarted: true,
+            });
+          },
         },
       );
 
@@ -2192,7 +2624,7 @@ export async function runEmbeddedAttempt(
             modelApi: params.model.api,
             modelId: params.modelId,
             provider: params.provider,
-            allowedToolNames,
+            allowedToolNames: replayAllowedToolNames,
             config: params.config,
             workspaceDir: effectiveWorkspace,
             env: process.env,
@@ -2343,10 +2775,9 @@ export async function runEmbeddedAttempt(
         await flushPendingToolResultsAfterIdle({
           agent: activeSession?.agent,
           sessionManager,
-          clearPendingOnTimeout: true,
           // PERF: If the run was aborted during the setup,
-          // skip the idle wait and clear pending results synchronously so we can
-          // immediately dispose the session and throw the error without blocking.
+          // skip the idle wait and flush pending results synchronously so we can
+          // immediately dispose the session without orphaning tool calls.
           ...(params.abortSignal?.aborted ? { timeoutMs: 0 } : {}),
         });
         activeSession.dispose();
@@ -2389,7 +2820,7 @@ export async function runEmbeddedAttempt(
           runAbortController.abort(reason);
         }
         abortCompaction();
-        void activeSession.abort();
+        void abortActiveSession();
       };
       idleTimeoutTrigger = (error) => {
         idleTimedOut = true;
@@ -2397,6 +2828,11 @@ export async function runEmbeddedAttempt(
       };
       const abortable = <T>(promise: Promise<T>): Promise<T> =>
         abortableWithSignal(runAbortController.signal, promise);
+      const promptActiveSession = (
+        prompt: string,
+        options?: Parameters<typeof activeSession.prompt>[1],
+      ): Promise<void> =>
+        abortable(trackPromptSettlePromise(activeSession.prompt(prompt, options)));
 
       const subscription = subscribeEmbeddedPiSession(
         buildEmbeddedSubscriptionParams({
@@ -2419,6 +2855,7 @@ export async function runEmbeddedAttempt(
           blockReplyChunking: params.blockReplyChunking,
           onPartialReply: params.onPartialReply,
           onAssistantMessageStart: params.onAssistantMessageStart,
+          onExecutionPhase: params.onExecutionPhase,
           onAgentEvent: params.onAgentEvent,
           onBeforeLifecycleTerminal: () => {
             // Clear embedded-run activity before emitting terminal lifecycle events so
@@ -2439,6 +2876,7 @@ export async function runEmbeddedAttempt(
       const {
         assistantTexts,
         toolMetas,
+        runToolLifecycle,
         unsubscribe,
         waitForCompactionRetry,
         isCompactionInFlight,
@@ -2451,12 +2889,54 @@ export async function runEmbeddedAttempt(
         getSuccessfulCronAdds,
         getReplayState,
         didSendViaMessagingTool,
+        didSendDeterministicApprovalPrompt,
         getLastToolError,
         setTerminalLifecycleMeta,
         getUsageTotals,
         getCompactionCount,
         getLastCompactionTokensAfter,
       } = subscription;
+      toolSearchCatalogExecutor = async (toolParams) => {
+        try {
+          const result = await runToolLifecycle({
+            toolName: toolParams.toolName,
+            toolCallId: toolParams.toolCallId,
+            args: toolParams.input,
+            execute: async () =>
+              await toolParams.tool.execute(
+                toolParams.toolCallId,
+                toolParams.input,
+                toolParams.signal ?? runAbortController.signal,
+                toolParams.onUpdate,
+                undefined as never,
+              ),
+          });
+          toolSearchTargetTranscriptProjections.push({
+            parentToolCallId: toolParams.parentToolCallId,
+            toolCallId: toolParams.toolCallId,
+            toolName: toolParams.toolName,
+            input: toolParams.input,
+            result,
+            timestamp: Date.now(),
+          });
+          return result;
+        } catch (error) {
+          const message = formatErrorMessage(error);
+          toolSearchTargetTranscriptProjections.push({
+            parentToolCallId: toolParams.parentToolCallId,
+            toolCallId: toolParams.toolCallId,
+            toolName: toolParams.toolName,
+            input: toolParams.input,
+            result: {
+              content: [{ type: "text", text: message }],
+              details: { status: "error", error: message },
+            },
+            isError: true,
+            timestamp: Date.now(),
+          });
+          throw error;
+        }
+      };
 
       const queueHandle: EmbeddedPiQueueHandle & {
         kind: "embedded";
@@ -2471,6 +2951,7 @@ export async function runEmbeddedAttempt(
         },
         isStreaming: () => activeSession.isStreaming,
         isCompacting: () => subscription.isCompacting(),
+        sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
         cancel: () => {
           abortRun();
         },
@@ -2828,13 +3309,14 @@ export async function runEmbeddedAttempt(
           const promptSubmission = resolveRuntimeContextPromptParts({
             effectivePrompt,
             transcriptPrompt: effectiveTranscriptPrompt,
+            emptyTranscriptMode: params.suppressNextUserMessagePersistence
+              ? "model-prompt"
+              : "runtime-event",
           });
-          const currentTurnPromptContextPrefix = promptSubmission.runtimeOnly
-            ? ""
-            : buildCurrentTurnPromptContextPrefix(params.currentTurnContext);
-          const promptForModel = [currentTurnPromptContextPrefix, promptSubmission.prompt]
-            .filter(Boolean)
-            .join("\n\n");
+          const promptForModel = buildCurrentTurnPrompt({
+            context: promptSubmission.runtimeOnly ? undefined : params.currentTurnContext,
+            prompt: promptSubmission.prompt,
+          });
           const runtimeSystemContext = promptSubmission.runtimeSystemContext?.trim();
           if (promptSubmission.runtimeOnly && runtimeSystemContext) {
             const runtimeSystemPrompt = composeSystemPromptWithHookContext({
@@ -2855,6 +3337,15 @@ export async function runEmbeddedAttempt(
                 appendSystemContext: buildRuntimeContextSystemContext(runtimeContextForHook),
               })
             : undefined;
+          if (systemPromptReport) {
+            systemPromptReport.currentTurn = {
+              ...(params.currentTurnKind ? { kind: params.currentTurnKind } : {}),
+              promptChars: promptForModel.length,
+              runtimeContextChars: promptSubmission.runtimeOnly
+                ? (runtimeSystemContext?.length ?? 0)
+                : (runtimeContextForHook?.length ?? 0),
+            };
+          }
           const systemPromptForHook = runtimeSystemPromptForHook ?? systemPromptText;
 
           const persistBlockedBeforeAgentRun = async (block: {
@@ -3011,11 +3502,17 @@ export async function runEmbeddedAttempt(
               messages: activeSession.messages,
               note: `images: prompt=${imageResult.images.length}`,
             });
+            const trajectoryProviderVisibleTools = toTrajectoryToolDefinitions(effectiveTools);
             trajectoryRecorder?.recordEvent("context.compiled", {
               systemPrompt: systemPromptForHook,
               prompt: promptForModel,
               messages: activeSession.messages,
-              tools: toTrajectoryToolDefinitions(effectiveTools),
+              tools: toTrajectoryToolDefinitions(
+                toolSearch.compacted ? uncompactedEffectiveTools : effectiveTools,
+              ),
+              ...(toolSearch.compacted
+                ? { providerVisibleTools: trajectoryProviderVisibleTools }
+                : {}),
               imagesCount: imageResult.images.length,
               streamStrategy,
               transport: effectiveAgentTransport,
@@ -3077,6 +3574,11 @@ export async function runEmbeddedAttempt(
             reserveTokens,
             trace: freezeDiagnosticTraceContext(createChildDiagnosticTraceContext(runTrace)),
           });
+          params.onExecutionPhase?.({
+            phase: "context_assembled",
+            provider: params.provider,
+            model: params.modelId,
+          });
 
           // Diagnostic: log context sizes before prompt to help debug early overflow errors.
           if (log.isEnabled("debug")) {
@@ -3106,6 +3608,7 @@ export async function runEmbeddedAttempt(
                     normalizeMessagesForLlmBoundary(activeSession.messages),
                   ),
                   imagesCount: imageResult.images.length,
+                  tools: tools,
                 },
                 {
                   runId: params.runId,
@@ -3228,7 +3731,7 @@ export async function runEmbeddedAttempt(
               inFlightPrompt: promptForModel,
             });
             if (promptSubmission.runtimeOnly) {
-              await abortable(activeSession.prompt(promptForModel));
+              await promptActiveSession(promptForModel);
             } else {
               await queueRuntimeContextForNextTurn({
                 session: activeSession,
@@ -3238,11 +3741,9 @@ export async function runEmbeddedAttempt(
               // Only pass images option if there are actually images to pass
               // This avoids potential issues with models that don't expect the images parameter
               if (imageResult.images.length > 0) {
-                await abortable(
-                  activeSession.prompt(promptForModel, { images: imageResult.images }),
-                );
+                await promptActiveSession(promptForModel, { images: imageResult.images });
               } else {
-                await abortable(activeSession.prompt(promptForModel));
+                await promptActiveSession(promptForModel);
               }
             }
           }
@@ -3384,7 +3885,10 @@ export async function runEmbeddedAttempt(
             );
           }
         }
-        messagesSnapshot = snapshotSelection.messagesSnapshot;
+        messagesSnapshot = projectToolSearchTargetTranscriptMessages(
+          snapshotSelection.messagesSnapshot,
+          toolSearchTargetTranscriptProjections,
+        );
         sessionIdUsed = snapshotSelection.sessionIdUsed;
 
         lastAssistant = messagesSnapshot
@@ -3664,6 +4168,15 @@ export async function runEmbeddedAttempt(
               sessionId: params.sessionId,
               provider: params.provider,
               model: params.modelId,
+              ...(params.contextWindowInfo?.tokens
+                ? { contextTokenBudget: params.contextWindowInfo.tokens }
+                : {}),
+              ...(params.contextWindowInfo?.source
+                ? { contextWindowSource: params.contextWindowInfo.source }
+                : {}),
+              ...(params.contextWindowInfo?.referenceTokens
+                ? { contextWindowReferenceTokens: params.contextWindowInfo.referenceTokens }
+                : {}),
               resolvedRef:
                 params.runtimePlan?.observability.resolvedRef ??
                 `${params.provider}/${params.modelId}`,
@@ -3682,6 +4195,15 @@ export async function runEmbeddedAttempt(
               sessionId: params.sessionId,
               workspaceDir: params.workspaceDir,
               trigger: params.trigger,
+              ...(params.contextWindowInfo?.tokens
+                ? { contextTokenBudget: params.contextWindowInfo.tokens }
+                : {}),
+              ...(params.contextWindowInfo?.source
+                ? { contextWindowSource: params.contextWindowInfo.source }
+                : {}),
+              ...(params.contextWindowInfo?.referenceTokens
+                ? { contextWindowReferenceTokens: params.contextWindowInfo.referenceTokens }
+                : {}),
               ...buildAgentHookContextChannelFields(params),
             },
           )
@@ -3794,12 +4316,14 @@ export async function runEmbeddedAttempt(
         currentAttemptAssistant,
         lastToolError: getLastToolError?.(),
         didSendViaMessagingTool: didSendViaMessagingTool(),
+        didSendDeterministicApprovalPrompt: didSendDeterministicApprovalPrompt(),
         messagingToolSentTexts: getMessagingToolSentTexts(),
         messagingToolSentMediaUrls: getMessagingToolSentMediaUrls(),
         messagingToolSentTargets: getMessagingToolSentTargets(),
         heartbeatToolResponse: getHeartbeatToolResponse(),
         toolMediaUrls: pendingToolMediaReply?.mediaUrls,
         toolAudioAsVoice: pendingToolMediaReply?.audioAsVoice,
+        toolTrustedLocalMedia: pendingToolMediaReply?.trustedLocalMedia,
         successfulCronAdds: getSuccessfulCronAdds(),
         cloudCodeAssistFormatError: Boolean(
           lastAssistant?.errorMessage && isCloudCodeAssistFormatError(lastAssistant.errorMessage),
@@ -3846,6 +4370,19 @@ export async function runEmbeddedAttempt(
       // See: https://github.com/openclaw/openclaw/issues/8643
       let cleanupError: unknown;
       try {
+        clearToolSearchCatalog({
+          sessionId: params.sessionId,
+          sessionKey: sandboxSessionKey,
+          agentId: sessionAgentId,
+          runId: params.runId,
+          catalogRef: toolSearchCatalogRef,
+        });
+        const cleanupAborted =
+          Boolean(params.abortSignal?.aborted) ||
+          aborted ||
+          timedOut ||
+          idleTimedOut ||
+          timedOutDuringCompaction;
         await cleanupEmbeddedAttemptResources({
           removeToolResultContextGuard,
           flushPendingToolResultsAfterIdle,
@@ -3855,13 +4392,11 @@ export async function runEmbeddedAttempt(
           bundleLspRuntime,
           sessionLock,
           // PERF: If the run was aborted (user stop, timeout, etc.), skip the idle wait
-          // and clear pending results synchronously so we can release the session lock ASAP.
-          aborted:
-            Boolean(params.abortSignal?.aborted) ||
-            aborted ||
-            timedOut ||
-            idleTimedOut ||
-            timedOutDuringCompaction,
+          // and flush pending results synchronously so we can release the session lock ASAP.
+          aborted: cleanupAborted,
+          abortSettlePromise: cleanupAborted ? buildAbortSettlePromise() : null,
+          runId: params.runId,
+          sessionId: params.sessionId,
         });
       } catch (err) {
         cleanupError = err;

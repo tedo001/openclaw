@@ -9,6 +9,19 @@ export const SessionCompactionCheckpointReasonSchema = Type.Union([
   Type.Literal("timeout-retry"),
 ]);
 
+export const SessionOperationEventSchema = Type.Object(
+  {
+    operationId: NonEmptyString,
+    operation: Type.Literal("compact"),
+    phase: Type.Union([Type.Literal("start"), Type.Literal("end")]),
+    sessionKey: NonEmptyString,
+    ts: Type.Integer({ minimum: 0 }),
+    completed: Type.Optional(Type.Boolean()),
+    reason: Type.Optional(Type.String()),
+  },
+  { additionalProperties: false },
+);
+
 export const SessionCompactionTranscriptReferenceSchema = Type.Object(
   {
     sessionId: NonEmptyString,
@@ -194,6 +207,8 @@ export const SessionsPatchParamsSchema = Type.Object(
     subagentControlScope: Type.Optional(
       Type.Union([Type.Literal("children"), Type.Literal("none"), Type.Null()]),
     ),
+    inheritedToolAllow: Type.Optional(Type.Union([Type.Array(NonEmptyString), Type.Null()])),
+    inheritedToolDeny: Type.Optional(Type.Union([Type.Array(NonEmptyString), Type.Null()])),
     sendPolicy: Type.Optional(
       Type.Union([Type.Literal("allow"), Type.Literal("deny"), Type.Null()]),
     ),

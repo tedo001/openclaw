@@ -134,7 +134,15 @@ export function isGatewayRunFastPathArgv(argv: string[]): boolean {
 }
 
 function hasJsonOutputFlag(argv: string[]): boolean {
-  return argv.some((arg) => arg === "--json" || arg.startsWith("--json="));
+  for (const arg of argv) {
+    if (arg === "--") {
+      return false;
+    }
+    if (arg === "--json" || arg.startsWith("--json=")) {
+      return true;
+    }
+  }
+  return false;
 }
 
 async function tryRunGatewayRunFastPath(
@@ -319,6 +327,47 @@ async function isPluginCliRoot(params: {
   }
 }
 
+function createAllowlistAgnosticCliLookupConfig(config: OpenClawConfig): OpenClawConfig {
+  if (!Array.isArray(config.plugins?.allow) || config.plugins.allow.length === 0) {
+    return config;
+  }
+  return {
+    ...config,
+    plugins: {
+      ...config.plugins,
+      allow: [],
+    },
+  };
+}
+
+async function resolveCliCommandSurfaceOwner(params: {
+  primary: string;
+  config: OpenClawConfig;
+}): Promise<string | undefined> {
+  const { resolveManifestCliCommandSurfaceOwner } =
+    await import("../plugins/manifest-command-aliases.runtime.js");
+  const manifestOwner = resolveManifestCliCommandSurfaceOwner({
+    command: params.primary,
+    config: params.config,
+    env: process.env,
+  });
+  if (manifestOwner) {
+    return manifestOwner;
+  }
+  try {
+    const { resolvePluginCliRootOwnerIds } = await import("../plugins/cli-registry-loader.js");
+    return (
+      await resolvePluginCliRootOwnerIds({
+        cfg: createAllowlistAgnosticCliLookupConfig(params.config),
+        env: process.env,
+        primaryCommand: params.primary,
+      })
+    )?.[0];
+  } catch {
+    return undefined;
+  }
+}
+
 async function resolveUnownedCliPrimary(params: {
   argv: string[];
   config: OpenClawConfig;
@@ -347,10 +396,12 @@ async function resolveUnownedCliPrimaryMessage(params: {
 }): Promise<string> {
   const { resolveManifestCommandAliasOwner, resolveManifestToolOwner } =
     await import("../plugins/manifest-command-aliases.runtime.js");
+  const cliCommandSurfaceOwner = await resolveCliCommandSurfaceOwner(params);
   return (
     resolveMissingPluginCommandMessageFromPolicy(params.primary, params.config, {
       resolveCommandAliasOwner: resolveManifestCommandAliasOwner,
       resolveToolOwner: resolveManifestToolOwner,
+      resolveCliCommandSurfaceOwner: () => cliCommandSurfaceOwner,
     }) ??
     `Unknown command: openclaw ${params.primary}. No built-in command or plugin CLI metadata owns "${params.primary}".`
   );
@@ -682,10 +733,33 @@ export async function runCli(argv: string[] = process.argv) {
         const config = await startupTrace.measure("register-plugin-commands", async () => {
           const { registerPluginCliCommandsFromValidatedConfig } =
             await import("../plugins/cli.js");
-          return await registerPluginCliCommandsFromValidatedConfig(program, undefined, undefined, {
-            mode: "lazy",
-            primary,
-          });
+          if (!hasJsonOutputFlag(parseArgv)) {
+            return await registerPluginCliCommandsFromValidatedConfig(
+              program,
+              undefined,
+              undefined,
+              {
+                mode: "lazy",
+                primary,
+              },
+            );
+          }
+          const { loggingState } = await import("../logging/state.js");
+          const previousForceStderr = loggingState.forceConsoleToStderr;
+          loggingState.forceConsoleToStderr = true;
+          try {
+            return await registerPluginCliCommandsFromValidatedConfig(
+              program,
+              undefined,
+              undefined,
+              {
+                mode: "lazy",
+                primary,
+              },
+            );
+          } finally {
+            loggingState.forceConsoleToStderr = previousForceStderr;
+          }
         });
         if (config) {
           if (
@@ -696,12 +770,17 @@ export async function runCli(argv: string[] = process.argv) {
           ) {
             const { resolveManifestCommandAliasOwner, resolveManifestToolOwner } =
               await import("../plugins/manifest-command-aliases.runtime.js");
+            const cliCommandSurfaceOwner = await resolveCliCommandSurfaceOwner({
+              primary,
+              config,
+            });
             const missingPluginCommandMessage = resolveMissingPluginCommandMessageFromPolicy(
               primary,
               config,
               {
                 resolveCommandAliasOwner: resolveManifestCommandAliasOwner,
                 resolveToolOwner: resolveManifestToolOwner,
+                resolveCliCommandSurfaceOwner: () => cliCommandSurfaceOwner,
               },
             );
             if (missingPluginCommandMessage) {
